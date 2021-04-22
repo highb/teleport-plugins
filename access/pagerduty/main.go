@@ -13,10 +13,6 @@ import (
 	"github.com/gravitational/trace"
 )
 
-const (
-	DefaultDir = "/var/lib/teleport/plugins/pagerduty"
-)
-
 func main() {
 	logger.Init()
 	app := kingpin.New("teleport-pagerduty", "Teleport plugin for access requests approval via PagerDuty.")
@@ -32,9 +28,6 @@ func main() {
 	debug := startCmd.Flag("debug", "Enable verbose logging to stderr").
 		Short('d').
 		Bool()
-	insecure := startCmd.Flag("insecure-no-tls", "Disable TLS for the callback server").
-		Default("false").
-		Bool()
 
 	selectedCmd, err := app.Parse(os.Args[1:])
 	if err != nil {
@@ -47,7 +40,7 @@ func main() {
 	case "version":
 		lib.PrintVersion(app.Name, Version, Gitref)
 	case "start":
-		if err := run(*path, *insecure, *debug); err != nil {
+		if err := run(*path, *debug); err != nil {
 			lib.Bail(err)
 		} else {
 			logger.Standard().Info("Successfully shut down")
@@ -55,7 +48,7 @@ func main() {
 	}
 }
 
-func run(configPath string, insecure bool, debug bool) error {
+func run(configPath string, debug bool) error {
 	conf, err := LoadConfig(configPath)
 	if err != nil {
 		return trace.Wrap(err)
@@ -72,7 +65,6 @@ func run(configPath string, insecure bool, debug bool) error {
 		logger.Standard().Debugf("DEBUG logging enabled")
 	}
 
-	conf.HTTP.Insecure = insecure
 	app, err := NewApp(*conf)
 	if err != nil {
 		return trace.Wrap(err)

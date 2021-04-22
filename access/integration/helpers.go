@@ -456,6 +456,13 @@ func (i *TeleInstance) SetAccessRequestState(ctx context.Context, update types.A
 	return i.Process.GetAuthServer().SetAccessRequestState(ctx, update)
 }
 
+func (i *TeleInstance) SubmitAccessReview(ctx context.Context, reqID string, review types.AccessReview) (types.AccessRequest, error) {
+	return i.Process.GetAuthServer().SubmitAccessReview(ctx, types.AccessReviewSubmission{
+		RequestID: reqID,
+		Review:    review,
+	})
+}
+
 func (i *TeleInstance) CreateExpiredAccessRequest(ctx context.Context, req types.AccessRequest) error {
 	ttl := time.Millisecond * 250
 	req.SetAccessExpiry(time.Now().Add(ttl))

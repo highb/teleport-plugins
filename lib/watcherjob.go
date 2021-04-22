@@ -2,6 +2,8 @@ package lib
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/gravitational/teleport-plugins/lib/logger"
@@ -14,19 +16,45 @@ import (
 
 type WatcherJobFunc func(context.Context, types.Event) error
 
+type WatcherJobConfig struct {
+	Watch          types.Watch
+	MaxConcurrency int
+	EventQueueSize int
+}
+
 type watcherJob struct {
 	ServiceJob
 	client    *client.Client
-	watch     types.Watch
+	config    WatcherJobConfig
 	eventFunc WatcherJobFunc
+	queues    map[watcherQueueKey]*watcherQueue
+	queueMu   sync.Mutex
 }
 
-func NewWatcherJob(client *client.Client, watch types.Watch, fn WatcherJobFunc) ServiceJob {
+type watcherQueueKey struct {
+	kind string
+	name string
+}
+
+type watcherQueue struct {
+	key  watcherQueueKey
+	ch   chan types.Event
+	busy int
+}
+
+func NewWatcherJob(client *client.Client, config WatcherJobConfig, fn WatcherJobFunc) ServiceJob {
 	client = client.WithCallOptions(grpc.WaitForReady(true)) // Enable backoff on reconnecting.
+	if config.MaxConcurrency == 0 {
+		config.MaxConcurrency = runtime.GOMAXPROCS(0)
+	}
+	if config.EventQueueSize == 0 {
+		config.EventQueueSize = 32
+	}
 	watcherJob := &watcherJob{
 		client:    client,
-		watch:     watch,
+		config:    config,
 		eventFunc: fn,
+		queues:    make(map[watcherQueueKey]*watcherQueue),
 	}
 	watcherJob.ServiceJob = NewServiceJob(func(ctx context.Context) error {
 		ctx, cancel := context.WithCancel(ctx)
@@ -55,8 +83,9 @@ func NewWatcherJob(client *client.Client, watch types.Watch, fn WatcherJobFunc) 
 	return watcherJob
 }
 
+// eventLoop reads the events from watcher and spawns temporary micro-queues.
 func (job *watcherJob) eventLoop(ctx context.Context) error {
-	watcher, err := job.client.NewWatcher(ctx, job.watch)
+	watcher, err := job.client.NewWatcher(ctx, job.config.Watch)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -73,20 +102,92 @@ func (job *watcherJob) eventLoop(ctx context.Context) error {
 	logger.Get(ctx).Debug("Watcher connected")
 	job.SetReady(true)
 
-	process := MustGetProcess(ctx)
-
 	for {
 		select {
 		case event := <-watcher.Events():
-			process.Spawn(func(ctx context.Context) error {
-				return job.eventFunc(ctx, event)
-			})
+			if err := job.enqueue(ctx, event); err != nil {
+				logger.Get(ctx).WithError(err).Error("Failed to enqueue an event")
+			}
 		case <-watcher.Done():
 			return trace.Wrap(watcher.Error())
 		}
 	}
 }
 
+// enqueue puts an event to a temporary micro-queue allocated for each resource to maintain the event order.
+func (job *watcherJob) enqueue(ctx context.Context, event types.Event) error {
+	queueKey := watcherQueueKey{kind: event.Resource.GetKind(), name: event.Resource.GetName()}
+
+	var (
+		queue *watcherQueue
+		exist bool
+	)
+	for {
+		if err := ctx.Err(); err != nil {
+			return trace.Wrap(err)
+		}
+
+		job.queueMu.Lock()
+		if queue, exist = job.queues[queueKey]; !exist {
+			if len(job.queues) >= job.config.MaxConcurrency {
+				job.queueMu.Unlock()
+				continue
+			}
+
+			queue = &watcherQueue{
+				key: queueKey,
+				ch:  make(chan types.Event, job.config.EventQueueSize),
+			}
+
+			job.queues[queueKey] = queue
+		}
+		queue.busy++
+		job.queueMu.Unlock()
+		break
+	}
+
+	queue.ch <- event
+
+	if !exist {
+		MustGetProcess(ctx).Spawn(func(ctx context.Context) error { return job.queueEventLoop(ctx, queue) })
+	}
+
+	return nil
+}
+
+// queueEventLoop dispatches a temporary micro-queue for a given resource.
+func (job *watcherJob) queueEventLoop(ctx context.Context, queue *watcherQueue) error {
+	defer job.tryDisposeQueue(queue)
+	for {
+		select {
+		case event := <-queue.ch:
+			job.queueMu.Lock()
+			queue.busy--
+			job.queueMu.Unlock()
+
+			_ = job.eventFunc(ctx, event)
+		default:
+			if job.tryDisposeQueue(queue) {
+				return nil
+			}
+		}
+	}
+}
+
+// tryDisposeQueue destroys the temporary micro-queue if it's empty.
+func (job *watcherJob) tryDisposeQueue(queue *watcherQueue) bool {
+	job.queueMu.Lock()
+	defer job.queueMu.Unlock()
+
+	if queue.busy == 0 {
+		delete(job.queues, queue.key)
+		return true
+	}
+
+	return false
+}
+
+// waitInit waits for OpInit event be received on a stream.
 func (job *watcherJob) waitInit(ctx context.Context, watcher types.Watcher, timeout time.Duration) error {
 	select {
 	case event := <-watcher.Events():

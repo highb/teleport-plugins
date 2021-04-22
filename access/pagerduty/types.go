@@ -4,20 +4,29 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/gravitational/teleport-plugins/access"
 )
 
 // Plugin data
 
+type Resolution string
+
+const Unresolved = Resolution("")
+const ResolvedApproved = Resolution("approved")
+const ResolvedDenied = Resolution("denied")
+const ResolvedExpired = Resolution("expired")
+
 type RequestData struct {
-	User    string
-	Roles   []string
-	Created time.Time
+	User          string
+	Roles         []string
+	Created       time.Time
+	RequestReason string
+	ReviewsCount  int
+	Resolution    Resolution
 }
 
 type PagerdutyData struct {
-	ID string
+	ServiceID  string
+	IncidentID string
 }
 
 type PluginData struct {
@@ -89,12 +98,6 @@ type ExtensionResult struct {
 	Extension Extension `json:"extension"`
 }
 
-type ListExtensionsQuery struct {
-	PaginationQuery
-	ExtensionObjectID string `url:"extension_object_id,omitempty"`
-	ExtensionSchemaID string `url:"extension_schema_id,omitempty"`
-}
-
 type ListExtensionsResult struct {
 	PaginationResult
 	Extensions []Extension `json:"extensions"`
@@ -110,13 +113,29 @@ type ServiceResult struct {
 	Service Service `json:"service"`
 }
 
+type ListServicesQuery struct {
+	PaginationQuery
+	Query string `url:"query,omitempty"`
+}
+
+type ListServicesResult struct {
+	PaginationResult
+	Services []Service `json:"services"`
+}
+
 type Incident struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Status      string    `json:"status"`
-	IncidentKey string    `json:"incident_key"`
-	Service     Reference `json:"service"`
-	Body        Details   `json:"body"`
+	ID          string               `json:"id"`
+	Title       string               `json:"title"`
+	Status      string               `json:"status"`
+	IncidentKey string               `json:"incident_key"`
+	Service     Reference            `json:"service"`
+	Assignments []IncidentAssignment `json:"assignments"`
+	Body        Details              `json:"body"`
+}
+
+type IncidentAssignment struct {
+	At       string    `json:"at"`
+	Assignee Reference `json:"assignee"`
 }
 
 type IncidentBody struct {
@@ -135,6 +154,18 @@ type IncidentBodyWrap struct {
 
 type IncidentResult struct {
 	Incident Incident `json:"incident"`
+}
+
+type ListIncidentsQuery struct {
+	PaginationQuery
+	UserIDs    []string `url:"user_ids,omitempty,brackets"`
+	Statuses   []string `url:"statuses,omitempty,brackets"`
+	ServiceIDs []string `url:"service_ids,omitempty,brackets"`
+}
+
+type ListIncidentsResult struct {
+	PaginationResult
+	Incidents []Incident `json:"incidents"`
 }
 
 type IncidentNote struct {
@@ -186,24 +217,35 @@ type ListOnCallsQuery struct {
 }
 
 type ListOnCallsResult struct {
+	PaginationResult
 	OnCalls []OnCall `json:"oncalls"`
 }
 
-func DecodePluginData(dataMap access.PluginDataMap) (data PluginData) {
+func DecodePluginData(dataMap map[string]string) (data PluginData) {
 	var created int64
 	data.User = dataMap["user"]
 	data.Roles = strings.Split(dataMap["roles"], ",")
 	fmt.Sscanf(dataMap["created"], "%d", &created)
 	data.Created = time.Unix(created, 0)
-	data.ID = dataMap["incident_id"]
+	data.RequestReason = dataMap["request_reason"]
+	if str := dataMap["reviews_count"]; str != "" {
+		fmt.Sscanf(str, "%d", &data.ReviewsCount)
+	}
+	data.Resolution = Resolution(dataMap["resolution"])
+	data.IncidentID = dataMap["incident_id"]
+	data.ServiceID = dataMap["service_id"]
 	return
 }
 
-func EncodePluginData(data PluginData) access.PluginDataMap {
-	return access.PluginDataMap{
-		"incident_id": data.ID,
-		"user":        data.User,
-		"roles":       strings.Join(data.Roles, ","),
-		"created":     fmt.Sprintf("%d", data.Created.Unix()),
+func EncodePluginData(data PluginData) map[string]string {
+	return map[string]string{
+		"incident_id":    data.IncidentID,
+		"service_id":     data.ServiceID,
+		"user":           data.User,
+		"roles":          strings.Join(data.Roles, ","),
+		"created":        fmt.Sprintf("%d", data.Created.Unix()),
+		"request_reason": data.RequestReason,
+		"reviews_count":  fmt.Sprintf("%d", data.ReviewsCount),
+		"resolution":     string(data.Resolution),
 	}
 }
